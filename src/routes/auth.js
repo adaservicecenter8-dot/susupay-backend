@@ -236,7 +236,7 @@ router.post('/otp/envoyer', async (req, res) => {
 
     // Nettoyer le numéro (garder + et chiffres)
     const tel = telephone.replace(/[^\d+]/g, '');
-    if (tel.length < 8) return res.status(400).json({ erreur: 'Numéro invalide' });
+    if (tel.length < 10 || tel.length > 16) return res.status(400).json({ erreur: 'Numéro invalide' });
 
     // S'assurer que la table existe
     await assurerTableOtp();
