@@ -144,27 +144,44 @@ router.post('/google', async (req, res) => {
 
     await assurerTableOtp();
 
-    // Chercher l'utilisateur existant (raw SQL pour compatibilité avec l'ancien client Prisma)
-    let users = email
-      ? await prisma.$queryRaw`SELECT * FROM "users" WHERE "googleId" = ${googleId} OR "email" = ${email} LIMIT 1`
-      : await prisma.$queryRaw`SELECT * FROM "users" WHERE "googleId" = ${googleId} LIMIT 1`;
-    let user = users?.[0] || null;
+    // Chercher par email d'abord (toujours sûr), puis par googleId si la colonne existe
+    let user = null;
+    if (email) {
+      const byEmail = await prisma.$queryRaw`SELECT * FROM "users" WHERE "email" = ${email} LIMIT 1`;
+      user = byEmail?.[0] || null;
+    }
+    if (!user) {
+      // Essayer par googleId (la colonne existe après assurerTableOtp)
+      try {
+        const byGid = await prisma.$queryRaw`SELECT * FROM "users" WHERE "googleId" = ${googleId} LIMIT 1`;
+        user = byGid?.[0] || null;
+      } catch { /* colonne pas encore créée */ }
+    }
 
     if (user) {
-      // Mettre à jour le googleId si pas encore lié
-      if (!user.googleId) {
-        await prisma.$executeRaw`UPDATE "users" SET "googleId" = ${googleId}, "avatarUrl" = COALESCE(${picture || null}, "avatarUrl"), "updatedAt" = NOW() WHERE "id" = ${user.id}`;
-        user.googleId = googleId;
-      }
+      // Lier le googleId si pas encore fait
+      try {
+        if (!user.googleId) {
+          await prisma.$executeRaw`UPDATE "users" SET "googleId" = ${googleId}, "updatedAt" = NOW() WHERE "id" = ${user.id}`;
+        }
+      } catch { /* colonne pas encore créée, pas grave */ }
     } else {
       // Créer un nouveau compte
       const newId = uuidv4();
       const nom = family_name || (name ? name.split(' ').slice(-1)[0] : 'Utilisateur');
       const prenom = given_name || (name ? name.split(' ')[0] : 'Nouveau');
-      await prisma.$executeRaw`
-        INSERT INTO "users" ("id", "nom", "prenom", "email", "googleId", "avatarUrl", "scoreFilabilite", "twoFaActive", "isVerified", "isActive", "createdAt", "updatedAt")
-        VALUES (${newId}, ${nom}, ${prenom}, ${email || null}, ${googleId}, ${picture || null}, 100.0, false, true, true, NOW(), NOW())
-      `;
+      try {
+        await prisma.$executeRaw`
+          INSERT INTO "users" ("id", "nom", "prenom", "email", "googleId", "avatarUrl", "scoreFilabilite", "twoFaActive", "isVerified", "isActive", "createdAt", "updatedAt")
+          VALUES (${newId}, ${nom}, ${prenom}, ${email || null}, ${googleId}, ${picture || null}, 100.0, false, true, true, NOW(), NOW())
+        `;
+      } catch {
+        // Fallback sans googleId si colonne manquante
+        await prisma.$executeRaw`
+          INSERT INTO "users" ("id", "nom", "prenom", "email", "avatarUrl", "scoreFilabilite", "twoFaActive", "isVerified", "isActive", "createdAt", "updatedAt")
+          VALUES (${newId}, ${nom}, ${prenom}, ${email || null}, ${picture || null}, 100.0, false, true, true, NOW(), NOW())
+        `;
+      }
       const newUsers = await prisma.$queryRaw`SELECT * FROM "users" WHERE "id" = ${newId}`;
       user = newUsers[0];
       await journaliser({ acteurId: user.id, action: 'INSCRIPTION_GOOGLE', entiteType: 'User', entiteId: user.id, req });
