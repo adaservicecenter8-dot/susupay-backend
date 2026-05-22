@@ -87,6 +87,7 @@ router.post('/:tontineId/sessions/:sessionId/paiements', authentifier, async (re
         titre: '💰 Paiement à valider',
         corps: `${paiement.payeur.prenom} ${paiement.payeur.nom} a enregistré un paiement de ${montant} FCFA`,
         type: 'PAIEMENT_RECU',
+        lienAction: `/tontines/${tontineId}/paiements`,
         io,
       });
     }
@@ -121,8 +122,9 @@ router.post('/:tontineId/paiements/:paiementId/valider', authentifier, autoriser
     await envoyerNotification({
       userId: paiement.payeurId,
       titre: '✅ Paiement validé',
-      corps: `Votre paiement de ${paiement.montant} FCFA a été validé. Reçu N° ${paiement.numerRecu}`,
+      corps: `Votre paiement de ${paiement.montant} FCFA a été validé`,
       type: 'PAIEMENT_RECU',
+      lienAction: `/tontines/${req.params.tontineId}/paiements`,
       io: req.app.get('io'),
     });
 
@@ -199,9 +201,78 @@ async function verifierEtDistribuer(session, req) {
       titre: '🎉 Distribution reçue !',
       corps: `Vous avez reçu ${montantTotal} FCFA de la tontine "${tontine.nom}"`,
       type: 'DISTRIBUTION',
+      lienAction: `/tontines/${tontine.id}`,
       io: req.app.get('io'),
     });
   }
 }
+
+// GET /api/tontines/:tontineId/export/csv
+router.get('/:tontineId/export/csv', authentifier, membreDeLaTontine, async (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    const tontine = await prisma.tontine.findUnique({ where: { id: req.params.tontineId }, select: { nom: true } });
+
+    const paiements = await prisma.paiement.findMany({
+      where: {
+        session: { cycle: { tontineId: req.params.tontineId } },
+        ...(sessionId && { sessionId }),
+      },
+      include: {
+        payeur: { select: { nom: true, prenom: true, telephone: true } },
+        session: { select: { numeroSession: true, datePlanifiee: true } },
+      },
+      orderBy: [{ session: { numeroSession: 'asc' } }, { enregistreLe: 'asc' }],
+    });
+
+    const METHODES_FR = { ESPECES: 'Espèces', VIREMENT: 'Virement', ORANGE_MONEY: 'Orange Money', MTN_MONEY: 'MTN Money', WAVE: 'Wave', AUTRE: 'Autre' };
+    const STATUTS_FR = { EN_ATTENTE: 'En attente', VALIDE: 'Validé', REJETE: 'Rejeté', REMBOURSE: 'Remboursé' };
+
+    const lignes = [
+      ['Membre', 'Téléphone', 'Session', 'Date prévue', 'Montant (FCFA)', 'Pénalité (FCFA)', 'Méthode', 'Statut', 'Date paiement'],
+      ...paiements.map((p) => [
+        `${p.payeur.prenom} ${p.payeur.nom}`,
+        p.payeur.telephone || '',
+        `Session ${p.session.numeroSession}`,
+        new Date(p.session.datePlanifiee).toLocaleDateString('fr-FR'),
+        Number(p.montant),
+        Number(p.montantPenalite),
+        METHODES_FR[p.methodePaiement] || p.methodePaiement,
+        STATUTS_FR[p.statut] || p.statut,
+        p.payeLe ? new Date(p.payeLe).toLocaleDateString('fr-FR') : '',
+      ]),
+    ];
+
+    const csv = lignes.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(';')).join('\n');
+    const nomFichier = `paiements-${(tontine?.nom || 'tontine').replace(/[^a-z0-9]/gi, '_')}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${nomFichier}"`);
+    res.send('﻿' + csv);
+  } catch {
+    res.status(500).json({ erreur: 'Erreur export CSV' });
+  }
+});
+
+// GET /api/tontines/:tontineId/historique
+router.get('/:tontineId/historique', authentifier, membreDeLaTontine, async (req, res) => {
+  try {
+    const { page = 1, limite = 20 } = req.query;
+    const paiements = await prisma.paiement.findMany({
+      where: { session: { cycle: { tontineId: req.params.tontineId } } },
+      include: {
+        payeur: { select: { id: true, nom: true, prenom: true, avatarUrl: true } },
+        session: { select: { numeroSession: true, datePlanifiee: true } },
+      },
+      orderBy: { enregistreLe: 'desc' },
+      skip: (Number(page) - 1) * Number(limite),
+      take: Number(limite),
+    });
+    const total = await prisma.paiement.count({ where: { session: { cycle: { tontineId: req.params.tontineId } } } });
+    res.json({ paiements, total, page: Number(page), totalPages: Math.ceil(total / Number(limite)) });
+  } catch {
+    res.status(500).json({ erreur: 'Erreur historique' });
+  }
+});
 
 module.exports = router;

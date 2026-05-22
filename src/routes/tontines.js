@@ -4,6 +4,13 @@ const { authentifier, autoriserRole, membreDeLaTontine } = require('../middlewar
 const { journaliser } = require('../utils/audit');
 const { notifierMembresTontine } = require('../utils/notifications');
 
+function genererCodeInvitation() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
 // GET /api/tontines — mes tontines
 router.get('/', authentifier, async (req, res) => {
   const tontines = await prisma.tontine.findMany({
@@ -27,6 +34,15 @@ router.post('/', authentifier, async (req, res) => {
     } = req.body;
 
     const tontine = await prisma.$transaction(async (tx) => {
+      let codeInvitation;
+      let tentatives = 0;
+      do {
+        codeInvitation = genererCodeInvitation();
+        const existant = await tx.tontine.findUnique({ where: { codeInvitation } });
+        if (!existant) break;
+        tentatives++;
+      } while (tentatives < 5);
+
       const t = await tx.tontine.create({
         data: {
           nom, description,
@@ -39,6 +55,7 @@ router.post('/', authentifier, async (req, res) => {
           avecCredit: Boolean(avecCredit),
           tauxInteretCredit: tauxInteretCredit ? Number(tauxInteretCredit) : null,
           createurId: req.user.id,
+          codeInvitation,
         },
       });
 
@@ -212,6 +229,108 @@ router.get('/:tontineId/audit', authentifier, autoriserRole('ADMINISTRATEUR', 'T
     take: 100,
   });
   res.json(logs);
+});
+
+// POST /api/tontines/:tontineId/nouveau-cycle
+router.post('/:tontineId/nouveau-cycle', authentifier, autoriserRole('ADMINISTRATEUR'), async (req, res) => {
+  try {
+    const tontine = await prisma.tontine.findUnique({
+      where: { id: req.params.tontineId },
+      include: {
+        membres: { where: { statut: 'ACTIF' }, orderBy: { position: 'asc' } },
+        cycles: { orderBy: { numeroCycle: 'desc' }, take: 1 },
+      },
+    });
+    if (!tontine) return res.status(404).json({ erreur: 'Tontine introuvable' });
+    if (tontine.statut !== 'EN_COURS') return res.status(400).json({ erreur: 'La tontine doit être en cours' });
+
+    const dernierCycle = tontine.cycles[0];
+    if (!dernierCycle) return res.status(400).json({ erreur: 'Aucun cycle précédent' });
+
+    const sessionsRestantes = await prisma.session.count({
+      where: { cycleId: dernierCycle.id, statut: { not: 'DISTRIBUEE' } },
+    });
+    if (sessionsRestantes > 0) return res.status(400).json({ erreur: `Il reste ${sessionsRestantes} session(s) non distribuée(s)` });
+
+    const frequenceJours = { HEBDOMADAIRE: 7, BIMENSUELLE: 14, MENSUELLE: 30, TRIMESTRIELLE: 90 };
+    const jours = frequenceJours[tontine.frequence] || 30;
+
+    const nouveauCycle = await prisma.$transaction(async (tx) => {
+      const c = await tx.cycle.create({
+        data: { tontineId: tontine.id, numeroCycle: dernierCycle.numeroCycle + 1, dateDebut: new Date() },
+      });
+      for (let i = 0; i < tontine.membres.length; i++) {
+        const datePlanifiee = new Date();
+        datePlanifiee.setDate(datePlanifiee.getDate() + jours * (i + 1));
+        await tx.session.create({
+          data: { cycleId: c.id, numeroSession: i + 1, datePlanifiee, beneficiaireId: tontine.membres[i].membreId },
+        });
+      }
+      return c;
+    });
+
+    await notifierMembresTontine({
+      tontineId: tontine.id,
+      titre: '🔄 Nouveau cycle démarré !',
+      corps: `Le cycle ${nouveauCycle.numeroCycle} de "${tontine.nom}" a commencé.`,
+      type: 'SYSTEME', io: req.app.get('io'),
+    });
+
+    await journaliser({ acteurId: req.user.id, tontineId: tontine.id, action: 'NOUVEAU_CYCLE', entiteType: 'Cycle', entiteId: nouveauCycle.id, req });
+    res.status(201).json(nouveauCycle);
+  } catch (err) {
+    res.status(500).json({ erreur: 'Erreur lors du démarrage du nouveau cycle' });
+  }
+});
+
+// GET /api/dashboard
+router.get('/dashboard', authentifier, async (req, res) => {
+  try {
+    const [tontines, notifs] = await Promise.all([
+      prisma.tontine.findMany({
+        where: { membres: { some: { membreId: req.user.id, statut: 'ACTIF' } } },
+        include: {
+          _count: { select: { membres: { where: { statut: 'ACTIF' } } } },
+          cycles: {
+            orderBy: { numeroCycle: 'desc' }, take: 1,
+            include: { sessions: { where: { statut: { in: ['EN_COURS', 'PLANIFIEE'] } }, orderBy: { datePlanifiee: 'asc' }, take: 1, include: { paiements: true } } },
+          },
+          membres: { where: { membreId: req.user.id } },
+        },
+      }),
+      prisma.notification.findMany({ where: { userId: req.user.id }, orderBy: { createdAt: 'desc' }, take: 5 }),
+    ]);
+
+    const prochainesEcheances = [];
+    for (const t of tontines) {
+      const session = t.cycles[0]?.sessions[0];
+      if (!session) continue;
+      const dejaPayé = session.paiements.some((p) => p.payeurId === req.user.id && ['VALIDE', 'EN_ATTENTE'].includes(p.statut));
+      if (!dejaPayé) {
+        prochainesEcheances.push({
+          tontineId: t.id, tontineNom: t.nom,
+          sessionId: session.id, datePlanifiee: session.datePlanifiee,
+          montant: t.montantCotisation,
+        });
+      }
+    }
+
+    prochainesEcheances.sort((a, b) => new Date(a.datePlanifiee) - new Date(b.datePlanifiee));
+
+    res.json({
+      stats: {
+        total: tontines.length,
+        actives: tontines.filter((t) => t.statut === 'EN_COURS').length,
+        ouvertes: tontines.filter((t) => t.statut === 'OUVERTE').length,
+        score: req.user.scoreFilabilite,
+      },
+      prochainesEcheances: prochainesEcheances.slice(0, 3),
+      tontines: tontines.slice(0, 5),
+      activiteRecente: notifs,
+    });
+  } catch (err) {
+    res.status(500).json({ erreur: 'Erreur dashboard' });
+  }
 });
 
 // Génération automatique du règlement

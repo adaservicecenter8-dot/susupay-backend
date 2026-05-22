@@ -2,7 +2,9 @@
 // Base de données : PostgreSQL
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  output        = "../src/generated/prisma"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
@@ -18,9 +20,10 @@ model User {
   id               String   @id @default(uuid())
   nom              String
   prenom           String
-  email            String   @unique
-  telephone        String   @unique
-  passwordHash     String
+  email            String?  @unique
+  telephone        String?  @unique
+  passwordHash     String?
+  googleId         String?  @unique
   avatarUrl        String?
   scoreFilabilite  Float    @default(100.0)
   twoFaSecret      String?
@@ -477,4 +480,19 @@ model AuditLog {
   createdAt   DateTime @default(now())
 
   @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────
+// OTP CODES (connexion par téléphone)
+// ─────────────────────────────────────────
+
+model OtpCode {
+  id        String   @id @default(uuid())
+  telephone String
+  code      String
+  expireAt  DateTime
+  utilise   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("otp_codes")
 }

@@ -21,7 +21,7 @@ router.post('/:tontineId/rejoindre', authentifier, async (req, res) => {
   try {
     const { codeInvitation } = req.body;
     const tontine = await prisma.tontine.findFirst({
-      where: { id: req.params.tontineId, codeInvitation },
+      where: { id: req.params.tontineId, codeInvitation: { equals: codeInvitation, mode: 'insensitive' } },
       include: { membres: { where: { statut: 'ACTIF' } } },
     });
 
@@ -103,8 +103,8 @@ router.post('/:tontineId/membres/:membreId/exclure', authentifier, autoriserRole
 
 // GET /api/tontines/inviter/:code — trouver tontine par code
 router.get('/inviter/:code', authentifier, async (req, res) => {
-  const tontine = await prisma.tontine.findUnique({
-    where: { codeInvitation: req.params.code },
+  const tontine = await prisma.tontine.findFirst({
+    where: { codeInvitation: { equals: req.params.code, mode: 'insensitive' } },
     select: {
       id: true, nom: true, description: true, montantCotisation: true,
       frequence: true, nombreMembres: true, statut: true,
@@ -185,6 +185,30 @@ router.post('/:tontineId/reglement/signer', authentifier, membreDeLaTontine, asy
 
   await journaliser({ acteurId: req.user.id, tontineId: req.params.tontineId, action: 'SIGNATURE_REGLEMENT', entiteType: 'SignatureReglement', entiteId: signature.id, req });
   res.json({ message: 'Règlement signé avec succès', signature });
+});
+
+// POST /api/tontines/:tontineId/quitter
+router.post('/:tontineId/quitter', authentifier, async (req, res) => {
+  try {
+    const { tontineId } = req.params;
+    const membre = await prisma.tontineMembre.findUnique({
+      where: { tontineId_membreId: { tontineId, membreId: req.user.id } },
+      include: { tontine: { select: { nom: true, statut: true, createurId: true } } },
+    });
+    if (!membre) return res.status(404).json({ erreur: 'Vous n\'êtes pas membre de cette tontine' });
+    if (membre.tontine.createurId === req.user.id) return res.status(400).json({ erreur: 'Le créateur ne peut pas quitter sa propre tontine' });
+    if (membre.tontine.statut === 'EN_COURS') return res.status(400).json({ erreur: 'Impossible de quitter une tontine en cours de cycle' });
+
+    await prisma.tontineMembre.update({
+      where: { tontineId_membreId: { tontineId, membreId: req.user.id } },
+      data: { statut: 'SORTI', sortLe: new Date() },
+    });
+
+    await journaliser({ acteurId: req.user.id, tontineId, action: 'SORTIE_TONTINE', entiteType: 'TontineMembre', entiteId: membre.id, req });
+    res.json({ message: `Vous avez quitté la tontine "${membre.tontine.nom}"` });
+  } catch {
+    res.status(500).json({ erreur: 'Erreur lors de la sortie' });
+  }
 });
 
 module.exports = router;
