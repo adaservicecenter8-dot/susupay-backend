@@ -4,3 +4,4 @@ uploads/
 *.log
 prisma/migrations/migration_lock.toml
 src/generated/
+logs/
