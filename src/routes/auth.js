@@ -178,7 +178,7 @@ router.post('/google', async (req, res) => {
     res.json({ user: userSafe, ...tokens });
   } catch (err) {
     console.error('Erreur Google auth:', err.message);
-    res.status(401).json({ erreur: 'Token Google invalide' });
+    res.status(401).json({ erreur: 'Token Google invalide', detail: err.message });
   }
 });
 
