@@ -185,11 +185,18 @@ router.post('/:tontineId/demarrer', authentifier, autoriserRole('ADMINISTRATEUR'
 
 // POST /api/tontines/:tontineId/ouvrir
 router.post('/:tontineId/ouvrir', authentifier, autoriserRole('ADMINISTRATEUR'), async (req, res) => {
-  const tontine = await prisma.tontine.update({
-    where: { id: req.params.tontineId, statut: 'BROUILLON' },
-    data: { statut: 'OUVERTE' },
-  });
-  res.json(tontine);
+  try {
+    const tontine = await prisma.tontine.findUnique({ where: { id: req.params.tontineId } });
+    if (!tontine) return res.status(404).json({ erreur: 'Tontine introuvable' });
+    if (tontine.statut !== 'BROUILLON') return res.status(400).json({ erreur: 'La tontine n\'est pas en brouillon' });
+    const updated = await prisma.tontine.update({
+      where: { id: req.params.tontineId },
+      data: { statut: 'OUVERTE' },
+    });
+    res.json(updated);
+  } catch {
+    res.status(500).json({ erreur: 'Erreur lors de l\'ouverture de la tontine' });
+  }
 });
 
 // GET /api/tontines/:tontineId/statistiques

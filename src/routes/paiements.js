@@ -102,6 +102,12 @@ router.post('/:tontineId/sessions/:sessionId/paiements', authentifier, async (re
 // POST /api/tontines/:tontineId/paiements/:paiementId/valider
 router.post('/:tontineId/paiements/:paiementId/valider', authentifier, autoriserRole('ADMINISTRATEUR', 'TRESORIER'), async (req, res) => {
   try {
+    const appartient = await prisma.paiement.findFirst({
+      where: { id: req.params.paiementId, session: { cycle: { tontineId: req.params.tontineId } } },
+    });
+    if (!appartient) return res.status(404).json({ erreur: 'Paiement introuvable dans cette tontine' });
+    if (appartient.statut !== 'EN_ATTENTE') return res.status(400).json({ erreur: 'Ce paiement n\'est pas en attente de validation' });
+
     const paiement = await prisma.paiement.update({
       where: { id: req.params.paiementId },
       data: { statut: 'VALIDE', valideLe: new Date(), valideParId: req.user.id },
@@ -111,12 +117,13 @@ router.post('/:tontineId/paiements/:paiementId/valider', authentifier, autoriser
       },
     });
 
-    // Améliorer le score de fiabilité si payé à temps
+    // Améliorer le score de fiabilité si payé à temps (borné entre 0 et 100)
     const retard = paiement.montantPenalite > 0;
-    await prisma.user.update({
-      where: { id: paiement.payeurId },
-      data: { scoreFilabilite: { increment: retard ? -5 : 2 } },
-    });
+    const delta = retard ? -5 : 2;
+    await prisma.$executeRaw`
+      UPDATE "users" SET "scoreFilabilite" = GREATEST(0, LEAST(100, "scoreFilabilite" + ${delta}))
+      WHERE "id" = ${paiement.payeurId}
+    `;
 
     // Notifier le payeur
     await envoyerNotification({
@@ -191,10 +198,11 @@ async function verifierEtDistribuer(session, req) {
 
   if (paiementsValides >= membres.length && session.beneficiaireId) {
     const montantTotal = membres.length * Number(tontine.montantCotisation);
-    await prisma.session.update({
-      where: { id: session.id },
+    const updated = await prisma.session.updateMany({
+      where: { id: session.id, statut: { not: 'DISTRIBUEE' } },
       data: { statut: 'DISTRIBUEE', dateEffective: new Date(), montantDistribue: montantTotal },
     });
+    if (updated.count === 0) return; // Déjà distribuée par un autre appel concurrent
 
     await envoyerNotification({
       userId: session.beneficiaireId,

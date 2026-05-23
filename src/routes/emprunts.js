@@ -86,6 +86,12 @@ router.post('/:tontineId/emprunts', authentifier, membreDeLaTontine, async (req,
 
 // POST /api/tontines/:tontineId/emprunts/:empruntId/approuver
 router.post('/:tontineId/emprunts/:empruntId/approuver', authentifier, autoriserRole('ADMINISTRATEUR', 'TRESORIER'), async (req, res) => {
+  const empruntExistant = await prisma.emprunt.findFirst({
+    where: { id: req.params.empruntId, tontineId: req.params.tontineId },
+  });
+  if (!empruntExistant) return res.status(404).json({ erreur: 'Emprunt introuvable' });
+  if (empruntExistant.statut !== 'EN_ATTENTE') return res.status(400).json({ erreur: 'Cet emprunt n\'est plus en attente d\'approbation' });
+
   const emprunt = await prisma.emprunt.update({
     where: { id: req.params.empruntId },
     data: { statut: 'EN_COURS', dateApprobation: new Date() },
@@ -112,7 +118,16 @@ router.post('/:tontineId/emprunts/:empruntId/remboursements', authentifier, asyn
       include: { remboursements: true },
     });
 
-    if (!emprunt || emprunt.statut !== 'EN_COURS') return res.status(400).json({ erreur: 'Emprunt invalide ou non en cours' });
+    if (!emprunt || emprunt.tontineId !== req.params.tontineId) return res.status(404).json({ erreur: 'Emprunt introuvable' });
+    if (emprunt.statut !== 'EN_COURS') return res.status(400).json({ erreur: 'Emprunt invalide ou non en cours' });
+
+    const membreActeur = await prisma.tontineMembre.findUnique({
+      where: { tontineId_membreId: { tontineId: req.params.tontineId, membreId: req.user.id } },
+    });
+    const estAdmin = ['ADMINISTRATEUR', 'TRESORIER'].includes(membreActeur?.role);
+    if (!estAdmin && emprunt.emprunteurId !== req.user.id) {
+      return res.status(403).json({ erreur: 'Vous ne pouvez pas enregistrer un remboursement pour un autre membre' });
+    }
 
     const totalRembourse = emprunt.remboursements.reduce((s, r) => s + Number(r.montant), 0);
     const resteARembourser = Number(emprunt.montantTotal) - totalRembourse;

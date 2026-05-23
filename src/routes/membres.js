@@ -29,18 +29,26 @@ router.post('/:tontineId/rejoindre', authentifier, async (req, res) => {
     if (tontine.statut !== 'OUVERTE') return res.status(400).json({ erreur: 'Cette tontine n\'accepte plus de membres' });
     if (tontine.membres.length >= tontine.nombreMembres) return res.status(400).json({ erreur: 'La tontine est complète' });
 
-    const dejaMembre = tontine.membres.find((m) => m.membreId === req.user.id);
+    const dejaMembre = await prisma.tontineMembre.findUnique({
+      where: { tontineId_membreId: { tontineId: tontine.id, membreId: req.user.id } },
+    });
     if (dejaMembre) return res.status(400).json({ erreur: 'Vous êtes déjà membre de cette tontine' });
 
-    const membre = await prisma.tontineMembre.create({
-      data: {
-        tontineId: tontine.id,
-        membreId: req.user.id,
-        role: 'MEMBRE',
-        statut: 'ACTIF',
-      },
-      include: { membre: { select: { nom: true, prenom: true } } },
-    });
+    // Transaction pour éviter la race condition sur la limite de membres
+    let membre;
+    try {
+      membre = await prisma.$transaction(async (tx) => {
+        const nbActuels = await tx.tontineMembre.count({ where: { tontineId: tontine.id, statut: 'ACTIF' } });
+        if (nbActuels >= tontine.nombreMembres) throw new Error('COMPLET');
+        return tx.tontineMembre.create({
+          data: { tontineId: tontine.id, membreId: req.user.id, role: 'MEMBRE', statut: 'ACTIF' },
+          include: { membre: { select: { nom: true, prenom: true } } },
+        });
+      });
+    } catch (txErr) {
+      if (txErr.message === 'COMPLET') return res.status(400).json({ erreur: 'La tontine est complète' });
+      throw txErr;
+    }
 
     await notifierMembresTontine({
       tontineId: tontine.id,
@@ -83,11 +91,11 @@ router.post('/:tontineId/membres/:membreId/exclure', authentifier, autoriserRole
     include: { membre: { select: { nom: true, prenom: true } }, tontine: { select: { nom: true } } },
   });
 
-  // Réduire le score de fiabilité du membre exclu
-  await prisma.user.update({
-    where: { id: req.params.membreId },
-    data: { scoreFilabilite: { decrement: 20 } },
-  });
+  // Réduire le score de fiabilité du membre exclu (borné à 0 minimum)
+  await prisma.$executeRaw`
+    UPDATE "users" SET "scoreFilabilite" = GREATEST(0, "scoreFilabilite" - 20)
+    WHERE "id" = ${req.params.membreId}
+  `;
 
   await envoyerNotification({
     userId: req.params.membreId,
