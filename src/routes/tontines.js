@@ -3,6 +3,7 @@ const { prisma } = require('../utils/prisma');
 const { authentifier, autoriserRole, membreDeLaTontine } = require('../middleware/auth');
 const { journaliser } = require('../utils/audit');
 const { notifierMembresTontine } = require('../utils/notifications');
+const { valider, creerTontineSchema } = require('../services/validationSchemas');
 
 function genererCodeInvitation() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -25,7 +26,7 @@ router.get('/', authentifier, async (req, res) => {
 });
 
 // POST /api/tontines — créer une tontine
-router.post('/', authentifier, async (req, res) => {
+router.post('/', authentifier, valider(creerTontineSchema), async (req, res) => {
   try {
     const {
       nom, description, montantCotisation, frequence, nombreMembres,
@@ -98,7 +99,10 @@ router.get('/:tontineId', authentifier, membreDeLaTontine, async (req, res) => {
         include: {
           sessions: {
             orderBy: { numeroSession: 'asc' },
-            include: { paiements: true },
+            include: {
+              beneficiaire: { select: { id: true, nom: true, prenom: true } },
+              _count: { select: { paiements: { where: { statut: 'VALIDE' } } } },
+            },
           },
         },
       },

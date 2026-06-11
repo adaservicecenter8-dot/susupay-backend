@@ -6,14 +6,26 @@ const { journaliser } = require('../utils/audit');
 
 // GET /api/tontines/:tontineId/litiges
 router.get('/:tontineId/litiges', authentifier, membreDeLaTontine, async (req, res) => {
-  const litiges = await prisma.litige.findMany({
-    where: { tontineId: req.params.tontineId },
-    include: {
-      rapporteur: { select: { id: true, nom: true, prenom: true, avatarUrl: true } },
-      votes: { include: { votant: { select: { id: true, nom: true, prenom: true } } } },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+  const { page = 1, statut } = req.query;
+  const limite = Math.min(Number(req.query.limite) || 20, 100);
+  const where = {
+    tontineId: req.params.tontineId,
+    ...(statut && { statut }),
+  };
+
+  const [litiges, total] = await Promise.all([
+    prisma.litige.findMany({
+      where,
+      include: {
+        rapporteur: { select: { id: true, nom: true, prenom: true, avatarUrl: true } },
+        votes: { include: { votant: { select: { id: true, nom: true, prenom: true } } } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Number(limite),
+      skip: (Number(page) - 1) * Number(limite),
+    }),
+    prisma.litige.count({ where }),
+  ]);
 
   const litgesEnrichis = litiges.map((l) => ({
     ...l,
@@ -22,7 +34,7 @@ router.get('/:tontineId/litiges', authentifier, membreDeLaTontine, async (req, r
     monVote: l.votes.find((v) => v.votantId === req.user.id)?.vote ?? null,
   }));
 
-  res.json(litgesEnrichis);
+  res.json({ litiges: litgesEnrichis, total, page: Number(page), totalPages: Math.ceil(total / Number(limite)) });
 });
 
 // POST /api/tontines/:tontineId/litiges — signaler un litige

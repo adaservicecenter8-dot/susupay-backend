@@ -7,20 +7,31 @@
     "start": "prisma generate && prisma db execute --file ./prisma/migrate_safe.sql --schema ./prisma/schema.prisma && node src/app.js",
     "dev": "nodemon src/app.js",
     "build": "prisma generate",
+    "test": "jest --testPathPatterns=src/__tests__ --forceExit",
+    "test:watch": "jest --testPathPatterns=src/__tests__ --watch",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "db:generate": "prisma generate",
     "db:seed": "node prisma/seed.js",
     "db:studio": "prisma studio"
   },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/src/__tests__/**/*.test.js"
+    ]
+  },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
     "@prisma/client": "5.22.0",
+    "@sentry/node": "^10.56.0",
     "africastalking": "^0.8.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
     "exceljs": "^4.4.0",
     "express": "^4.18.2",
+    "express-async-errors": "^3.1.1",
     "express-rate-limit": "^7.1.5",
     "express-validator": "^7.0.1",
     "google-auth-library": "^10.6.2",
@@ -36,9 +47,12 @@
     "qrcode": "^1.5.3",
     "socket.io": "^4.6.2",
     "uuid": "^9.0.0",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "nodemon": "^3.0.3"
+    "jest": "^30.4.2",
+    "nodemon": "^3.0.3",
+    "supertest": "^7.2.2"
   }
 }

@@ -19,7 +19,7 @@ router.get('/:tontineId/pdf', authentifier, async (req, res) => {
       include: {
         membres: {
           where: { statut: 'ACTIF' },
-          include: { membre: { select: { nom: true, prenom: true, telephone: true } } },
+          include: { membre: { select: { nom: true, prenom: true } } }, // téléphone exclu du PDF
         },
         cycles: {
           include: {
@@ -91,7 +91,7 @@ router.get('/:tontineId/pdf', authentifier, async (req, res) => {
 });
 
 // GET /api/exports/:tontineId/reglement-pdf — règlement signé
-router.get('/:tontineId/reglement-pdf', authentifier, async (req, res) => {
+router.get('/:tontineId/reglement-pdf', authentifier, membreDeLaTontine, async (req, res) => {
   const tontineId = req.params.tontineId;
   const reglement = await prisma.reglement.findFirst({
     where: { tontineId, actif: true },

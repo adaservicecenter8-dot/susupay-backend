@@ -4,7 +4,8 @@ const { authentifier, autoriserRole, membreDeLaTontine } = require('../middlewar
 
 // GET /api/tontines/:tontineId/messages
 router.get('/:tontineId/messages', authentifier, membreDeLaTontine, async (req, res) => {
-  const { page = 1, limite = 50 } = req.query;
+  const { page = 1 } = req.query;
+  const limite = Math.min(Number(req.query.limite) || 50, 100);
   const messages = await prisma.message.findMany({
     where: { tontineId: req.params.tontineId },
     include: {
@@ -56,15 +57,23 @@ router.post('/:tontineId/messages', authentifier, membreDeLaTontine, async (req,
 
 // GET /api/tontines/:tontineId/annonces
 router.get('/:tontineId/annonces', authentifier, membreDeLaTontine, async (req, res) => {
-  const annonces = await prisma.message.findMany({
-    where: { tontineId: req.params.tontineId, estAnnonce: true },
-    include: {
-      expediteur: { select: { id: true, nom: true, prenom: true } },
-      _count: { select: { lectures: true } },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-  res.json(annonces);
+  const { page = 1 } = req.query;
+  const limite = Math.min(Number(req.query.limite) || 20, 100);
+  const where = { tontineId: req.params.tontineId, estAnnonce: true };
+  const [annonces, total] = await Promise.all([
+    prisma.message.findMany({
+      where,
+      include: {
+        expediteur: { select: { id: true, nom: true, prenom: true } },
+        _count: { select: { lectures: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Number(limite),
+      skip: (Number(page) - 1) * Number(limite),
+    }),
+    prisma.message.count({ where }),
+  ]);
+  res.json({ annonces, total, page: Number(page), totalPages: Math.ceil(total / Number(limite)) });
 });
 
 module.exports = router;

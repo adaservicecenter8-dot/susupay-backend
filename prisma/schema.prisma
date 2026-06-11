@@ -30,6 +30,12 @@ model User {
   twoFaActive      Boolean  @default(false)
   isVerified       Boolean  @default(false)
   isActive         Boolean  @default(true)
+  kycStatut        KycStatut @default(NONE)
+  kycPiece         String?
+  kycNumero        String?
+  kycDateValidation DateTime?
+  consentementCGU  Boolean  @default(false)
+  consentementDate DateTime?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
@@ -47,8 +53,17 @@ model User {
   swapsCibles       EchangePosition[] @relation("cible")
   signaturesReg     SignatureReglement[]
   tontinesCreees    Tontine[]
+  sessionsBeneficiaire Session[] @relation("beneficiaire")
+  objectifsEpargne  ObjectifEpargne[]
 
   @@map("users")
+}
+
+enum KycStatut {
+  NONE
+  EN_COURS
+  VALIDE
+  REJETE
 }
 
 // ─────────────────────────────────────────
@@ -147,6 +162,7 @@ model TontineMembre {
 
   @@unique([tontineId, membreId])
   @@unique([tontineId, position])
+  @@index([membreId])
   @@map("tontine_membres")
 }
 
@@ -192,6 +208,7 @@ model Session {
   datePlanifiee   DateTime
   dateEffective   DateTime?
   beneficiaireId  String?
+  beneficiaire    User?         @relation("beneficiaire", fields: [beneficiaireId], references: [id])
   montantDistribue Decimal?     @db.Decimal(15, 2)
   statut          StatutSession @default(PLANIFIEE)
   createdAt       DateTime      @default(now())
@@ -199,6 +216,9 @@ model Session {
   paiements       Paiement[]
 
   @@unique([cycleId, numeroSession])
+  @@index([cycleId])
+  @@index([statut])
+  @@index([datePlanifiee])
   @@map("sessions")
 }
 
@@ -240,6 +260,9 @@ model Paiement {
   valideLe        DateTime?
   valideParId     String?
 
+  @@index([sessionId])
+  @@index([payeurId])
+  @@index([statut])
   @@map("paiements")
 }
 
@@ -270,6 +293,7 @@ model SignatureReglement {
   signeLe      DateTime  @default(now())
   adresseIp    String?
   userAgent    String?
+  nomSaisi     String?
 
   @@unique([reglementId, membreId])
   @@map("signatures_reglement")
@@ -385,6 +409,8 @@ model Litige {
 
   votes        VoteLitige[]
 
+  @@index([tontineId])
+  @@index([statut])
   @@map("litiges")
 }
 
@@ -418,6 +444,7 @@ model Message {
 
   lectures    LectureMessage[]
 
+  @@index([tontineId])
   @@map("messages")
 }
 
@@ -457,6 +484,8 @@ model Notification {
   lienAction String?
   createdAt DateTime         @default(now())
 
+  @@index([userId])
+  @@index([lu])
   @@map("notifications")
 }
 
@@ -480,6 +509,43 @@ model AuditLog {
   createdAt   DateTime @default(now())
 
   @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────
+// ÉPARGNE INDIVIDUELLE
+// ─────────────────────────────────────────
+
+model ObjectifEpargne {
+  id            String    @id @default(uuid())
+  user          User      @relation(fields: [userId], references: [id])
+  userId        String
+  nom           String
+  description   String?
+  icone         String    @default("🎯")
+  couleur       String    @default("blue")
+  montantCible  Decimal   @db.Decimal(15, 2)
+  montantActuel Decimal   @db.Decimal(15, 2) @default(0)
+  dateEcheance  DateTime?
+  termine       Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  versements    VersementObjectif[]
+
+  @@index([userId])
+  @@map("objectifs_epargne")
+}
+
+model VersementObjectif {
+  id         String          @id @default(uuid())
+  objectif   ObjectifEpargne @relation(fields: [objectifId], references: [id], onDelete: Cascade)
+  objectifId String
+  montant    Decimal         @db.Decimal(15, 2)
+  note       String?
+  createdAt  DateTime        @default(now())
+
+  @@index([objectifId])
+  @@map("versements_objectif")
 }
 
 // ─────────────────────────────────────────

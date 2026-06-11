@@ -4,7 +4,8 @@ const { authentifier } = require('../middleware/auth');
 
 // GET /api/notifications
 router.get('/', authentifier, async (req, res) => {
-  const { page = 1, limite = 30, nonLues } = req.query;
+  const { page = 1, nonLues } = req.query;
+  const limite = Math.min(Number(req.query.limite) || 30, 100);
   const notifications = await prisma.notification.findMany({
     where: { userId: req.user.id, ...(nonLues === 'true' && { lu: false }) },
     orderBy: { createdAt: 'desc' },

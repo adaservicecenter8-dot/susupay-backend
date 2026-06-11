@@ -3,28 +3,37 @@ const { prisma } = require('../utils/prisma');
 const { authentifier, autoriserRole, membreDeLaTontine } = require('../middleware/auth');
 const { journaliser } = require('../utils/audit');
 const { envoyerNotification, notifierMembresTontine } = require('../utils/notifications');
+const { valider, enregistrerPaiementSchema } = require('../services/validationSchemas');
+const { verifierEtDistribuer, mettreAJourScore } = require('../services/paiementService');
 
 // GET /api/tontines/:tontineId/paiements
 router.get('/:tontineId/paiements', authentifier, membreDeLaTontine, async (req, res) => {
-  const { sessionId, membreId, statut } = req.query;
-  const paiements = await prisma.paiement.findMany({
-    where: {
-      session: { cycle: { tontineId: req.params.tontineId } },
-      ...(sessionId && { sessionId }),
-      ...(membreId && { payeurId: membreId }),
-      ...(statut && { statut }),
-    },
-    include: {
-      payeur: { select: { id: true, nom: true, prenom: true, avatarUrl: true } },
-      session: { select: { id: true, numeroSession: true, datePlanifiee: true } },
-    },
-    orderBy: { enregistreLe: 'desc' },
-  });
-  res.json(paiements);
+  const { sessionId, membreId, statut, page = 1 } = req.query;
+  const limite = Math.min(Number(req.query.limite) || 50, 100); // max 100 par page
+  const where = {
+    session: { cycle: { tontineId: req.params.tontineId } },
+    ...(sessionId && { sessionId }),
+    ...(membreId && { payeurId: membreId }),
+    ...(statut && { statut }),
+  };
+  const [paiements, total] = await Promise.all([
+    prisma.paiement.findMany({
+      where,
+      include: {
+        payeur: { select: { id: true, nom: true, prenom: true, avatarUrl: true } },
+        session: { select: { id: true, numeroSession: true, datePlanifiee: true } },
+      },
+      orderBy: { enregistreLe: 'desc' },
+      take: Number(limite),
+      skip: (Number(page) - 1) * Number(limite),
+    }),
+    prisma.paiement.count({ where }),
+  ]);
+  res.json({ paiements, total, page: Number(page), totalPages: Math.ceil(total / Number(limite)) });
 });
 
 // POST /api/tontines/:tontineId/sessions/:sessionId/paiements — enregistrer un paiement
-router.post('/:tontineId/sessions/:sessionId/paiements', authentifier, async (req, res) => {
+router.post('/:tontineId/sessions/:sessionId/paiements', authentifier, valider(enregistrerPaiementSchema), async (req, res) => {
   try {
     const { montant, methodePaiement, reference, note, payeurId } = req.body;
     const { tontineId, sessionId } = req.params;
@@ -42,6 +51,15 @@ router.post('/:tontineId/sessions/:sessionId/paiements', authentifier, async (re
     if (!session) return res.status(404).json({ erreur: 'Session introuvable' });
     if (session.statut === 'DISTRIBUEE' || session.statut === 'ANNULEE') {
       return res.status(400).json({ erreur: 'Cette session est clôturée' });
+    }
+
+    // KYC obligatoire pour les paiements >= 500 000 FCFA (Loi 2016-992 LCB-FT)
+    const SEUIL_KYC = 500000;
+    if (Number(montant) >= SEUIL_KYC) {
+      const payeur = await prisma.user.findUnique({ where: { id: cibleId }, select: { kycStatut: true } });
+      if (payeur?.kycStatut !== 'VALIDE') {
+        return res.status(403).json({ erreur: 'Vérification d\'identité (KYC) requise pour les paiements ≥ 500 000 FCFA. Complétez votre KYC dans votre profil.', code: 'KYC_REQUIRED' });
+      }
     }
 
     // Vérifier si déjà payé
@@ -117,13 +135,8 @@ router.post('/:tontineId/paiements/:paiementId/valider', authentifier, autoriser
       },
     });
 
-    // Améliorer le score de fiabilité si payé à temps (borné entre 0 et 100)
     const retard = paiement.montantPenalite > 0;
-    const delta = retard ? -5 : 2;
-    await prisma.$executeRaw`
-      UPDATE "users" SET "scoreFilabilite" = GREATEST(0, LEAST(100, "scoreFilabilite" + ${delta}))
-      WHERE "id" = ${paiement.payeurId}
-    `;
+    await mettreAJourScore(paiement.payeurId, retard);
 
     // Notifier le payeur
     await envoyerNotification({
@@ -135,8 +148,7 @@ router.post('/:tontineId/paiements/:paiementId/valider', authentifier, autoriser
       io: req.app.get('io'),
     });
 
-    // Vérifier si tous les membres ont payé → distribuer automatiquement
-    await verifierEtDistribuer(paiement.session, req);
+    await verifierEtDistribuer(paiement.sessionId, req.app.get('io'));
 
     await journaliser({ acteurId: req.user.id, tontineId: req.params.tontineId, action: 'VALIDATION_PAIEMENT', entiteType: 'Paiement', entiteId: paiement.id, req });
     res.json(paiement);
@@ -189,31 +201,6 @@ router.get('/:tontineId/sessions/:sessionId/tableau', authentifier, membreDeLaTo
 
   res.json({ session, tableau, totalCollecte: paiementsValides.reduce((s, p) => s + Number(p.montant), 0) });
 });
-
-// Logique de distribution automatique
-async function verifierEtDistribuer(session, req) {
-  const tontine = session.cycle.tontine;
-  const membres = await prisma.tontineMembre.findMany({ where: { tontineId: tontine.id, statut: 'ACTIF' } });
-  const paiementsValides = await prisma.paiement.count({ where: { sessionId: session.id, statut: 'VALIDE' } });
-
-  if (paiementsValides >= membres.length && session.beneficiaireId) {
-    const montantTotal = membres.length * Number(tontine.montantCotisation);
-    const updated = await prisma.session.updateMany({
-      where: { id: session.id, statut: { not: 'DISTRIBUEE' } },
-      data: { statut: 'DISTRIBUEE', dateEffective: new Date(), montantDistribue: montantTotal },
-    });
-    if (updated.count === 0) return; // Déjà distribuée par un autre appel concurrent
-
-    await envoyerNotification({
-      userId: session.beneficiaireId,
-      titre: '🎉 Distribution reçue !',
-      corps: `Vous avez reçu ${montantTotal} FCFA de la tontine "${tontine.nom}"`,
-      type: 'DISTRIBUTION',
-      lienAction: `/tontines/${tontine.id}`,
-      io: req.app.get('io'),
-    });
-  }
-}
 
 // GET /api/tontines/:tontineId/export/csv
 router.get('/:tontineId/export/csv', authentifier, membreDeLaTontine, async (req, res) => {

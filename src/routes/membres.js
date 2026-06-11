@@ -9,7 +9,7 @@ router.get('/:tontineId/membres', authentifier, membreDeLaTontine, async (req, r
   const membres = await prisma.tontineMembre.findMany({
     where: { tontineId: req.params.tontineId },
     include: {
-      membre: { select: { id: true, nom: true, prenom: true, avatarUrl: true, telephone: true, scoreFilabilite: true } },
+      membre: { select: { id: true, nom: true, prenom: true, avatarUrl: true, scoreFilabilite: true } },
     },
     orderBy: { position: 'asc' },
   });
@@ -84,9 +84,22 @@ router.put('/:tontineId/membres/:membreId/role', authentifier, autoriserRole('AD
 // DELETE /api/tontines/:tontineId/membres/:membreId/exclure
 router.post('/:tontineId/membres/:membreId/exclure', authentifier, autoriserRole('ADMINISTRATEUR'), async (req, res) => {
   const { raison } = req.body;
+  const { tontineId, membreId } = req.params;
+
+  if (membreId === req.user.id) {
+    return res.status(400).json({ erreur: 'Vous ne pouvez pas vous exclure vous-même' });
+  }
+
+  const cible = await prisma.tontineMembre.findUnique({
+    where: { tontineId_membreId: { tontineId, membreId } },
+  });
+  if (!cible) return res.status(404).json({ erreur: 'Membre introuvable' });
+  if (cible.role === 'ADMINISTRATEUR') {
+    return res.status(400).json({ erreur: 'Impossible d\'exclure un administrateur' });
+  }
 
   const membre = await prisma.tontineMembre.update({
-    where: { tontineId_membreId: { tontineId: req.params.tontineId, membreId: req.params.membreId } },
+    where: { tontineId_membreId: { tontineId, membreId } },
     data: { statut: 'EXCLU', sortLe: new Date() },
     include: { membre: { select: { nom: true, prenom: true } }, tontine: { select: { nom: true } } },
   });
@@ -140,6 +153,11 @@ router.put('/:tontineId/membres/:membreId/position', authentifier, autoriserRole
 
 // POST /api/tontines/:tontineId/tirage-aleatoire
 router.post('/:tontineId/tirage-aleatoire', authentifier, autoriserRole('ADMINISTRATEUR'), async (req, res) => {
+  const tontine = await prisma.tontine.findUnique({ where: { id: req.params.tontineId } });
+  if (!tontine) return res.status(404).json({ erreur: 'Tontine introuvable' });
+  if (tontine.statut === 'EN_COURS' || tontine.statut === 'TERMINEE') {
+    return res.status(400).json({ erreur: 'Impossible de modifier les positions une fois la tontine démarrée' });
+  }
   const membres = await prisma.tontineMembre.findMany({
     where: { tontineId: req.params.tontineId, statut: 'ACTIF' },
   });
@@ -187,7 +205,7 @@ router.post('/:tontineId/reglement/signer', authentifier, membreDeLaTontine, asy
 
   const signature = await prisma.signatureReglement.upsert({
     where: { reglementId_membreId: { reglementId: reglement.id, membreId: req.user.id } },
-    create: { reglementId: reglement.id, membreId: req.user.id, adresseIp: req.ip, userAgent: req.headers['user-agent'] },
+    create: { reglementId: reglement.id, membreId: req.user.id, adresseIp: req.ip, userAgent: req.headers['user-agent'], nomSaisi: req.body.nomSaisi || null },
     update: { signeLe: new Date() },
   });
 

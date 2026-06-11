@@ -6,6 +6,8 @@ const QRCode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const { prisma } = require('../utils/prisma');
 const { journaliser } = require('../utils/audit');
+const tokenBlacklist = require('../services/tokenBlacklist');
+const { encrypt: encryptSecret, decrypt: decryptSecret, encryptionActive } = require('../utils/cryptoUtil');
 
 // ─── SMS via Africa's Talking ──────────────────────────────
 async function envoyerSMS(telephone, message) {
@@ -27,13 +29,20 @@ const genererTokens = (userId) => ({
 // POST /api/auth/inscription
 router.post('/inscription', async (req, res) => {
   try {
-    const { nom, prenom, email, telephone, motDePasse } = req.body;
+    const { nom, prenom, email, telephone, motDePasse, consentementCGU } = req.body;
 
     if (!nom || !prenom || !email || !telephone || !motDePasse) {
       return res.status(400).json({ erreur: 'Tous les champs sont requis' });
     }
+    if (!consentementCGU) {
+      return res.status(400).json({ erreur: 'Vous devez accepter les CGU pour créer un compte' });
+    }
     if (motDePasse.length < 8) {
       return res.status(400).json({ erreur: 'Le mot de passe doit faire au moins 8 caractères' });
+    }
+    const telNet = telephone.replace(/\s/g, '');
+    if (!/^\+?[0-9]{8,15}$/.test(telNet)) {
+      return res.status(400).json({ erreur: 'Numéro de téléphone invalide (format international requis, ex: +2250701234567)' });
     }
 
     const existant = await prisma.user.findFirst({ where: { OR: [{ email }, { telephone }] } });
@@ -41,7 +50,7 @@ router.post('/inscription', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(motDePasse, 12);
     const user = await prisma.user.create({
-      data: { nom, prenom, email: email.toLowerCase(), telephone, passwordHash },
+      data: { nom, prenom, email: email.toLowerCase(), telephone, passwordHash, consentementCGU: true, consentementDate: new Date() },
       select: { id: true, nom: true, prenom: true, email: true, telephone: true },
     });
 
@@ -66,8 +75,9 @@ router.post('/connexion', async (req, res) => {
 
     // Vérification 2FA si activé
     if (user.twoFaActive) {
-      if (!codeOtp) return res.status(200).json({ requiert2FA: true });
-      const otpValide = totp.check(codeOtp, user.twoFaSecret);
+      if (!codeOtp) return res.status(401).json({ requiert2FA: true });
+      const secret = decryptSecret(user.twoFaSecret);
+      const otpValide = totp.check(codeOtp, secret);
       if (!otpValide) return res.status(401).json({ erreur: 'Code OTP invalide' });
     }
 
@@ -76,8 +86,9 @@ router.post('/connexion', async (req, res) => {
     const tokens = genererTokens(user.id);
     const { passwordHash, twoFaSecret, ...userSafe } = user;
     res.json({ user: userSafe, ...tokens });
-  } catch {
-    res.status(500).json({ erreur: 'Erreur lors de la connexion' });
+  } catch (err) {
+    console.error('[auth/connexion] Erreur:', err.message);
+    res.status(500).json({ erreur: 'Erreur serveur lors de la connexion' });
   }
 });
 
@@ -86,6 +97,7 @@ router.post('/refresh', async (req, res) => {
   try {
     const { refreshToken } = req.body;
     if (!refreshToken) return res.status(401).json({ erreur: 'Token manquant' });
+    if (await tokenBlacklist.estInvalide(refreshToken)) return res.status(401).json({ erreur: 'Token révoqué' });
 
     const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
     const tokens = genererTokens(payload.userId);
@@ -95,15 +107,26 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-// POST /api/auth/2fa/activer
-router.post('/2fa/activer', async (req, res) => {
+// POST /api/auth/deconnexion
+router.post('/deconnexion', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (refreshToken) {
+    const SEPT_JOURS_MS = 7 * 24 * 60 * 60 * 1000;
+    tokenBlacklist.invalider(refreshToken, SEPT_JOURS_MS);
+  }
+  res.json({ message: 'Déconnecté avec succès' });
+});
+
+// POST /api/auth/2fa/activer — REQUIERT authentification JWT
+router.post('/2fa/activer', require('../middleware/auth').authentifier, async (req, res) => {
   try {
-    const { userId } = req.body;
+    const userId = req.user.id; // ← depuis le JWT vérifié, jamais depuis req.body
     const secret = totp.generateSecret();
-    await prisma.user.update({ where: { id: userId }, data: { twoFaSecret: secret } });
+    const secretStocke = encryptionActive() ? encryptSecret(secret) : secret;
+    await prisma.user.update({ where: { id: userId }, data: { twoFaSecret: secretStocke } });
 
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
-    const otpauthUrl = totp.keyuri(user.email, process.env.APP_NAME || 'TontineApp', secret);
+    const otpauthUrl = totp.keyuri(user.email || userId, process.env.APP_NAME || 'SusuPay', secret);
     const qrCode = await QRCode.toDataURL(otpauthUrl);
 
     res.json({ secret, qrCode });
@@ -112,14 +135,17 @@ router.post('/2fa/activer', async (req, res) => {
   }
 });
 
-// POST /api/auth/2fa/confirmer
-router.post('/2fa/confirmer', async (req, res) => {
+// POST /api/auth/2fa/confirmer — REQUIERT authentification JWT
+router.post('/2fa/confirmer', require('../middleware/auth').authentifier, async (req, res) => {
   try {
-    const { userId, code } = req.body;
+    const userId = req.user.id; // ← depuis le JWT vérifié
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ erreur: 'Code requis' });
+
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.twoFaSecret) return res.status(400).json({ erreur: 'Secret 2FA non initialisé' });
 
-    const valide = totp.check(code, user.twoFaSecret);
+    const valide = totp.check(code, decryptSecret(user.twoFaSecret));
     if (!valide) return res.status(400).json({ erreur: 'Code invalide' });
 
     await prisma.user.update({ where: { id: userId }, data: { twoFaActive: true } });
@@ -135,7 +161,16 @@ router.post('/google', async (req, res) => {
     const { token } = req.body;
     if (!token) return res.status(400).json({ erreur: 'Token Google manquant' });
 
-    // Récupérer les infos utilisateur via l'access_token (implicit flow)
+    // Valider le token Google et vérifier l'audience si GOOGLE_CLIENT_ID est défini
+    const tokenInfoResp = await fetch(`https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${token}`);
+    if (!tokenInfoResp.ok) return res.status(401).json({ erreur: 'Token Google invalide' });
+    const tokenInfo = await tokenInfoResp.json();
+    if (tokenInfo.error) return res.status(401).json({ erreur: 'Token Google invalide' });
+    if (process.env.GOOGLE_CLIENT_ID && tokenInfo.azp !== process.env.GOOGLE_CLIENT_ID && tokenInfo.aud !== process.env.GOOGLE_CLIENT_ID) {
+      return res.status(401).json({ erreur: 'Token Google non autorisé pour cette application' });
+    }
+
+    // Récupérer les infos utilisateur via l'access_token
     const userInfoResp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -195,7 +230,7 @@ router.post('/google', async (req, res) => {
     res.json({ user: userSafe, ...tokens });
   } catch (err) {
     console.error('Erreur Google auth:', err.message);
-    res.status(401).json({ erreur: 'Token Google invalide', detail: err.message });
+    res.status(401).json({ erreur: 'Token Google invalide' });
   }
 });
 
@@ -228,6 +263,27 @@ async function assurerTableOtp() {
   }
 }
 
+// Compteur de tentatives OTP par téléphone (en mémoire — suffisant pour un serveur unique)
+const otpTentatives = new Map(); // tel → { count, resetAt }
+const MAX_OTP_TENTATIVES = 5;
+const FENETRE_OTP_MS = 15 * 60 * 1000; // 15 minutes
+
+function verifierRateLimitOtp(tel) {
+  const now = Date.now();
+  const entry = otpTentatives.get(tel);
+  if (entry && now < entry.resetAt) {
+    if (entry.count >= MAX_OTP_TENTATIVES) return false;
+    entry.count++;
+  } else {
+    otpTentatives.set(tel, { count: 1, resetAt: now + FENETRE_OTP_MS });
+  }
+  return true;
+}
+
+function resetRateLimitOtp(tel) {
+  otpTentatives.delete(tel);
+}
+
 // POST /api/auth/otp/envoyer — Envoyer un code OTP par SMS
 router.post('/otp/envoyer', async (req, res) => {
   try {
@@ -238,30 +294,37 @@ router.post('/otp/envoyer', async (req, res) => {
     const tel = telephone.replace(/[^\d+]/g, '');
     if (tel.length < 10 || tel.length > 16) return res.status(400).json({ erreur: 'Numéro invalide' });
 
+    // Rate limit : max 5 OTP par téléphone par 15 minutes
+    if (!verifierRateLimitOtp(`send:${tel}`)) {
+      return res.status(429).json({ erreur: 'Trop de demandes. Attendez 15 minutes avant de réessayer.' });
+    }
+
     // S'assurer que la table existe
     await assurerTableOtp();
 
-    // Générer code 6 chiffres
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    // Générer code 6 chiffres cryptographiquement sûr
+    const { randomInt, createHash } = require('crypto');
+    const code = String(randomInt(100000, 1000000)).padStart(6, '0');
+    const codeHash = createHash('sha256').update(code).digest('hex'); // stocker le hash, jamais le code clair
     const expireAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
     // Invalider les anciens codes non utilisés
     await prisma.$executeRaw`UPDATE "otp_codes" SET "utilise" = true WHERE "telephone" = ${tel} AND "utilise" = false`;
 
-    // Sauvegarder le nouveau code
+    // Sauvegarder le hash du code (jamais le code en clair)
     await prisma.$executeRaw`
       INSERT INTO "otp_codes" ("id", "telephone", "code", "expireAt", "utilise", "createdAt")
-      VALUES (${uuidv4()}, ${tel}, ${code}, ${expireAt}, false, NOW())
+      VALUES (${uuidv4()}, ${tel}, ${codeHash}, ${expireAt}, false, NOW())
     `;
 
     // Envoyer le SMS
     await envoyerSMS(tel, `Votre code SusuPay : ${code}. Valable 5 minutes. Ne le partagez pas.`);
 
-    // En mode dev, renvoyer le code dans la réponse
-    const modeTest = !process.env.AT_API_KEY;
+    // En développement local uniquement, afficher le code dans la réponse
+    const estDev = process.env.NODE_ENV !== 'production' && !process.env.AT_API_KEY;
     res.json({
       message: `Code envoyé au ${tel}`,
-      ...(modeTest && { codeTest: code, note: 'Mode test : code visible car SMS non configuré' }),
+      ...(estDev && { codeTest: code, note: 'Mode dev : code visible car SMS non configuré' }),
     });
   } catch (err) {
     console.error('Erreur envoi OTP:', err.message);
@@ -277,19 +340,29 @@ router.post('/otp/verifier', async (req, res) => {
 
     const tel = telephone.replace(/[^\d+]/g, '');
 
+    // Rate limit vérification : max 10 tentatives par téléphone par 15 min
+    if (!verifierRateLimitOtp(`verify:${tel}`)) {
+      return res.status(429).json({ erreur: 'Trop de tentatives. Attendez 15 minutes.' });
+    }
+
     await assurerTableOtp();
 
-    // Vérifier le code
+    // Comparer le hash SHA-256 du code soumis
+    const { createHash } = require('crypto');
+    const codeHash = createHash('sha256').update(code.trim()).digest('hex');
+
     const now = new Date();
     const otps = await prisma.$queryRaw`
       SELECT "id" FROM "otp_codes"
-      WHERE "telephone" = ${tel} AND "code" = ${code} AND "utilise" = false AND "expireAt" > ${now}
+      WHERE "telephone" = ${tel} AND "code" = ${codeHash} AND "utilise" = false AND "expireAt" > ${now}
       ORDER BY "createdAt" DESC LIMIT 1
     `;
     if (!otps || otps.length === 0) return res.status(401).json({ erreur: 'Code incorrect ou expiré' });
 
-    // Marquer comme utilisé
+    // Marquer comme utilisé + réinitialiser le rate limit
     await prisma.$executeRaw`UPDATE "otp_codes" SET "utilise" = true WHERE "id" = ${otps[0].id}`;
+    resetRateLimitOtp(`verify:${tel}`);
+    resetRateLimitOtp(`send:${tel}`);
 
     // Chercher ou créer l'utilisateur
     let user = await prisma.user.findUnique({ where: { telephone: tel } });

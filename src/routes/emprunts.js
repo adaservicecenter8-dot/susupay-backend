@@ -3,6 +3,7 @@ const { prisma } = require('../utils/prisma');
 const { authentifier, autoriserRole, membreDeLaTontine } = require('../middleware/auth');
 const { envoyerNotification, notifierMembresTontine } = require('../utils/notifications');
 const { journaliser } = require('../utils/audit');
+const { valider, demanderEmpruntSchema } = require('../services/validationSchemas');
 
 // GET /api/tontines/:tontineId/emprunts
 router.get('/:tontineId/emprunts', authentifier, membreDeLaTontine, async (req, res) => {
@@ -29,7 +30,7 @@ router.get('/:tontineId/emprunts', authentifier, membreDeLaTontine, async (req, 
 });
 
 // POST /api/tontines/:tontineId/emprunts — demande d'emprunt
-router.post('/:tontineId/emprunts', authentifier, membreDeLaTontine, async (req, res) => {
+router.post('/:tontineId/emprunts', authentifier, membreDeLaTontine, valider(demanderEmpruntSchema), async (req, res) => {
   try {
     const { montant, dureeRemboursement, motif } = req.body;
     const tontine = await prisma.tontine.findUnique({ where: { id: req.params.tontineId } });
@@ -42,6 +43,15 @@ router.post('/:tontineId/emprunts', authentifier, membreDeLaTontine, async (req,
       where: { tontineId: req.params.tontineId, emprunteurId: req.user.id, statut: { in: ['APPROUVE', 'EN_COURS'] } },
     });
     if (empruntActif) return res.status(400).json({ erreur: 'Vous avez déjà un emprunt en cours' });
+
+    // KYC obligatoire pour les emprunts >= 500 000 FCFA (Loi 2016-992 LCB-FT)
+    const SEUIL_KYC = 500000;
+    if (Number(montant) >= SEUIL_KYC) {
+      const emprunteur = await prisma.user.findUnique({ where: { id: req.user.id }, select: { kycStatut: true } });
+      if (emprunteur?.kycStatut !== 'VALIDE') {
+        return res.status(403).json({ erreur: 'Vérification d\'identité (KYC) requise pour les emprunts ≥ 500 000 FCFA. Complétez votre KYC dans votre profil.', code: 'KYC_REQUIRED' });
+      }
+    }
 
     const tauxInteret = Number(tontine.tauxInteretCredit);
     const montantNum = Number(montant);
